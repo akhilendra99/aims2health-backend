@@ -1,0 +1,9 @@
+# Node artifact files
+node_modules/
+dist/
+.env
+env.backup.txt
+env.prod
+*.backup
+# Local database runtime and credentials
+.local-db/

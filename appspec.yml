@@ -1,0 +1,25 @@
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /home/ubuntu/aims2health_backend
+permissions:
+  - object: /home/ubuntu
+    owner: ubuntu
+    group: ubuntu
+    type:
+      - directory
+      - file
+hooks:
+  # BeforeInstall:
+  #   - location: deploy_scripts/install.sh
+  #     timeout: 300
+  #     runas: root
+  ApplicationStart:
+    - location: deploy_scripts/run.sh
+      timeout: 500
+      runas: ubuntu
+  ValidateService:
+    - location: deploy_scripts/validate.sh
+      timeout: 200
+      runas: ubuntu

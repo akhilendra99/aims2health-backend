@@ -1,0 +1,37 @@
+{
+  "name": "virtual-sathi-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "build": "node server.js",
+    "debug": "nodemon --inspect server.js",
+    "test:authorization:mysql": "node --test tests/authorization.test.cjs"
+  },
+  "author": "wizztech.co.in",
+  "license": "ISC",
+  "dependencies": {
+    "@sendgrid/mail": "^7.4.4",
+    "aws-sdk": "^2.1692.0",
+    "axios": "^1.7.9",
+    "bcryptjs": "^2.4.3",
+    "body-parser": "^1.20.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.5.1",
+    "fix-esm": "^1.0.1",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.0",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.11.0",
+    "needle": "^3.2.0",
+    "node-fetch": "^3.3.1",
+    "nodemon": "^3.1.9",
+    "razorpay": "^2.0.6",
+    "twilio": "^4.7.1"
+  }
+}
