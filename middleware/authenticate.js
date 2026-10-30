@@ -6,10 +6,14 @@ const validId = value => ['string', 'number'].includes(typeof value) && /^(?:[1-
 
 // Keep legacy sessions valid, but distinguish helper_id from userId. Roles
 // come from the verified token and its signing domain, never request fields.
-module.exports = function authenticate(roles) {
+function authenticate(roles, { cookieOnly = false } = {}) {
   return (req, res, next) => {
     const header = req.headers.authorization;
-    const token = header && header.startsWith('Bearer ') ? header.slice(7) : req.cookies?.auth_token;
+    const token = cookieOnly
+      ? req.cookies?.auth_token
+      : header && header.startsWith('Bearer ')
+        ? header.slice(7)
+        : req.cookies?.auth_token;
     if (!token || isBlacklisted(token)) return res.status(401).json({ message: 'You are not authenticated!' });
     const configured = ['patient', 'doctor', 'admin'].map(role => process.env[secrets[role]]);
     if (configured.some(secret => !secret) || new Set(configured).size !== configured.length) {
@@ -31,5 +35,7 @@ module.exports = function authenticate(roles) {
     }
     return res.status(authenticated ? 403 : 401).json({ message: authenticated ? 'Forbidden.' : 'You are not authenticated!' });
   };
-};
+}
+module.exports = authenticate;
+module.exports.cookieOnly = roles => authenticate(roles, { cookieOnly: true });
 module.exports.validId = validId;

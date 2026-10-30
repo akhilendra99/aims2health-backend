@@ -1,9 +1,16 @@
-const express = require("express");
+﻿const express = require("express");
 const router = express.Router();
 const publicRecord = require("../utils/public-record");
 const mysql = require("mysql2");
 const bcrypt = require("bcryptjs");
 const { comparePasswordOrDummy } = require("../utils/password-auth");
+const {
+  createLoginLockKeys,
+  isLoginLocked,
+  recordLoginFailure,
+  clearLoginFailures,
+} = require("../utils/login-lockout");
+const { isPasswordValid, INVALID_PASSWORD_MESSAGE } = require("../utils/password-policy");
 const jwt = require("jsonwebtoken");
 const multer = require("multer");
 const needle = require("needle");
@@ -53,8 +60,6 @@ const razorpay_instance = new Razorpay({
 // regular expressions for input validation
 
 const emailExpression = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-const passwordExpression =
-  /^(?=.*[0-9])(?=.*[!@#$%^&*])[a-zA-Z0-9!@#$%^&*]{8,16}$/;
 const phoneExpression = /^\d{10}$/;
 const pinExpression = /^\d{6}$/;
 
@@ -74,7 +79,7 @@ const storage = multer.diskStorage({
     if (isValid) {
       error = null;
     }
-    // Absolute path (not cwd-dependent) with a self-healing mkdir — a
+    // Absolute path (not cwd-dependent) with a self-healing mkdir â€” a
     // bare relative "images" string broke when the process's cwd wasn't
     // the backend root, producing ENOENT on every upload.
     const uploadDir = path.join(__dirname, "..", "images");
@@ -83,7 +88,7 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, call_back) => {
     const ext = MIME_TYPE_MAP[file.mimetype];
-    // Strip anything but [a-z0-9] from the original filename — closes both
+    // Strip anything but [a-z0-9] from the original filename â€” closes both
     // the mojibake issue (e.g. macOS's narrow-no-break-space in screenshot
     // names surviving a naive .split(" ")) and path traversal via a
     // malicious originalname (e.g. "../../etc/passwd").
@@ -367,7 +372,7 @@ router.post("/requestEmergency", patientSession, async (req, res, next) => {
 
     console.log(twilioResponse.sid);
 
-    // Send via ZeptoMail — services.netxcell.com:8081 (the previous
+    // Send via ZeptoMail â€” services.netxcell.com:8081 (the previous
     // provider) is unreachable. VAPT L1 Finding 15 / L2 Finding 18,
     // "Broken Functionality".
     try {
@@ -899,7 +904,7 @@ router.post("/sendEmailVerifyOTP", patientSession, async (req, res, next) => {
   const challengeKey = patientOtpKey(req.userData.userId, emailToSend);
   otpStore.set(challengeKey, { otp, expiresAt: Date.now() + 8 * 60 * 1000 });
 
-  // Send OTP email via ZeptoMail — services.netxcell.com:8081 (the previous
+  // Send OTP email via ZeptoMail â€” services.netxcell.com:8081 (the previous
   // provider) is unreachable (confirmed independently from multiple
   // networks, not an EC2-specific firewall issue). VAPT L1 Finding 15 / L2
   // Finding 18, "Broken Functionality".
@@ -907,7 +912,7 @@ router.post("/sendEmailVerifyOTP", patientSession, async (req, res, next) => {
     await zeptomail.sendMail({
       to: emailToSend,
       subject: "Your OTP for Email Verification",
-      text: `Dear User,\n\nYour OTP for secure login is ${otp}.\nThis OTP is valid for 10 minutes.`,
+      text: `Dear User,\n\nYour OTP for secure login is ${otp}.\nThis OTP is valid for 8 minutes.`,
     });
     res.status(201).json({
       vstatus: "OTP sent successfully",
@@ -1091,8 +1096,10 @@ router.post("/verify-otp-login", (req, res) => {
       { expiresIn: "1h" },
     );
 
+    const csrfToken = generateCsrfToken();
+    res.cookie("auth_token", token, authCookieOptions());
+    res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
     res.status(200).json({
-      token,
       expiresIn: 3600,
       userId: result[0].patient_id,
 
@@ -1103,11 +1110,8 @@ router.post("/verify-otp-login", (req, res) => {
 });
 
 router.put("/chpwd", patientSession, (req, res, next) => {
-  if (!passwordExpression.test(req.body.newpwd)) {
-    return res.status(400).json({
-      message:
-        "Password must be 8-16 characters and include at least one number and one special character (!@#$%^&*).",
-    });
+  if (typeof req.body?.oldpwd !== "string" || !req.body.oldpwd || Buffer.byteLength(req.body.oldpwd, "utf8") > 72 || !isPasswordValid(req.body.newpwd)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
   }
 
   var sql = `SELECT * FROM patient_details WHERE patient_id= ?`;
@@ -1175,6 +1179,9 @@ router.put("/chpwd", patientSession, (req, res, next) => {
 });
 
 router.post("/signup", (req, res, next) => {
+  if (!isPasswordValid(req.body?.password)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+  }
   if (req.body.medical_history == "") {
     medical_history = "Default from Virtual Sathi";
   }
@@ -1231,11 +1238,6 @@ router.post("/signup", (req, res, next) => {
     //alert("Please enter your date of birth!");
     res.status(401).json({
       message: "Adding Patient failed! Date of Birth field cannot be empty.",
-    });
-  } else if (!passwordExpression.test(req.body.password)) {
-    res.status(401).json({
-      message:
-        "Adding Patient failed! Password doesnt matches the predefined criteria.",
     });
   } else if (req.body.mobile_no == "") {
     //alert("Please enter your phone number!");
@@ -1588,6 +1590,10 @@ router.post("/add-patients", patientSession, async (req, res) => {
       abhaId,
     } = req.body;
 
+    if (!isPasswordValid(password)) {
+      return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+    }
+
     let medical_history_val =
       medical_history?.trim() || "Default from Virtual Sathi";
 
@@ -1613,10 +1619,8 @@ router.post("/add-patients", patientSession, async (req, res) => {
       return res.status(400).json({ message: "Name too long." });
     if (!emailExpression.test(email))
       return res.status(400).json({ message: "Invalid email." });
-    if (!passwordExpression.test(password))
-      return res
-        .status(400)
-        .json({ message: "Password does not meet criteria." });
+    if (!isPasswordValid(password))
+      return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
     if (!mobile_no || !mobile_secondary)
       return res
         .status(400)
@@ -2191,9 +2195,9 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                             } else {
                               console.log("updated...");
 
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                               // WHATSAPP NOTIFICATION TO DOCTOR (fixed time + date format)
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                               try {
                                 let doctorMobile =
                                   calendarData.mobile != null
@@ -2264,7 +2268,7 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                                   }
                                 } else {
                                   console.log(
-                                    "No doctor mobile number found — skipping WhatsApp",
+                                    "No doctor mobile number found â€” skipping WhatsApp",
                                   );
                                 }
                               } catch (whatsappErr) {
@@ -2273,11 +2277,11 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                                   whatsappErr,
                                 );
                               }
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                               const formattedDate = formatDate(apptDate);
 
-                              // Send via ZeptoMail — services.netxcell.com:8081
+                              // Send via ZeptoMail â€” services.netxcell.com:8081
                               // (the previous provider) is unreachable. VAPT L1
                               // Finding 15 / L2 Finding 18, "Broken Functionality".
                               try {
@@ -2330,9 +2334,9 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                                   "Error while fetching calendar details - creating appointment!",
                               });
                             } else {
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                               // WHATSAPP NOTIFICATION TO DOCTOR (fixed time + date format)
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                               try {
                                 let doctorMobile =
                                   calendarData.mobile != null
@@ -2403,7 +2407,7 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                                   }
                                 } else {
                                   console.log(
-                                    "No doctor mobile number found — skipping WhatsApp",
+                                    "No doctor mobile number found â€” skipping WhatsApp",
                                   );
                                 }
                               } catch (whatsappErr) {
@@ -2412,11 +2416,11 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
                                   whatsappErr,
                                 );
                               }
-                              // ───────────────────────────────────────────────────────────────
+                              // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
                               const formattedDate = formatDate(apptDate);
 
-                              // Send via ZeptoMail — services.netxcell.com:8081
+                              // Send via ZeptoMail â€” services.netxcell.com:8081
                               // (the previous provider) is unreachable. VAPT L1
                               // Finding 15 / L2 Finding 18, "Broken Functionality".
                               try {
@@ -2476,45 +2480,53 @@ router.post("/setappointment", patientAccess(req => req.body.patient_id ?? (req.
 });
 
 router.post("/login", (req, res, next) => {
-  //var sql = `SELECT * FROM patient_details WHERE email_id= '${req.body.email}'`;
-  var sql = `SELECT * FROM patient_details WHERE email_id= ?`;
-
-  //console.log(req.body)
-  con.query(sql, [req.body.email], function (err, result, fields) {
-    if (err) {
-      res.status(401).json({
-        message: "Invalid Authentication Credentials!",
-      });
-    } else {
-      if (result.length <= 0) {
-        comparePasswordOrDummy(req.body.password, undefined, 11).then(() => {
-          res.status(401).json({ message: "Invalid Authentication Credentials!" });
-        }).catch(() => res.status(401).json({ message: "Invalid Authentication Credentials!" }));
-      } else {
-        comparePasswordOrDummy(req.body.password, result[0].hashed_pwd, 11)
-          .then((auth_result) => {
-            if (!auth_result) {
-              res.status(401).json({ message: "Invalid Authentication Credentials!" });
-            } else {
-              const token = jwt.sign(
-                { email: result[0].email_id, userId: result[0].patient_id, role: "patient" },
-                "" + process.env.JWT_SECRET_PATIENT,
-                { expiresIn: "1h" },
-              );
-              const csrfToken = generateCsrfToken();
-              res.cookie("auth_token", token, authCookieOptions());
-              res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
-              res.status(200).json({
-                expiresIn: 3600,
-                userId: +result[0].patient_id,
-                userEmail: result[0].email_id,
-                userName: result[0].fname + " " + result[0].lname,
-              });
-            }
-          })
-          .catch(() => res.status(401).json({ message: "Invalid Authentication Credentials!" }));
-      }
+  (async () => {
+    const identifierKeys = createLoginLockKeys({ identifier: req.body?.email, identifierType: "email" });
+    if (await isLoginLocked(con, identifierKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
     }
+
+    const result = await new Promise((resolve, reject) => {
+      con.query("SELECT * FROM patient_details WHERE email_id = ?", [req.body?.email], (err, rows) => err ? reject(err) : resolve(rows));
+    });
+    if (result.length <= 0) {
+      await comparePasswordOrDummy(req.body?.password, undefined, 11);
+      await recordLoginFailure(con, identifierKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+
+    const user = result[0];
+    const lockKeys = createLoginLockKeys({ identifier: req.body?.email, role: "patient", accountId: user.patient_id });
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const authResult = await comparePasswordOrDummy(req.body?.password, user.hashed_pwd, 11);
+    if (!authResult) {
+      await recordLoginFailure(con, lockKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    await clearLoginFailures(con, lockKeys);
+
+    const token = jwt.sign(
+      { email: user.email_id, userId: user.patient_id, role: "patient" },
+      "" + process.env.JWT_SECRET_PATIENT,
+      { expiresIn: "1h" },
+    );
+    const csrfToken = generateCsrfToken();
+    res.cookie("auth_token", token, authCookieOptions());
+    res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
+    return res.status(200).json({
+      expiresIn: 3600,
+      userId: +user.patient_id,
+      userEmail: user.email_id,
+      userName: user.fname + " " + user.lname,
+    });
+  })().catch(error => {
+    console.error("Patient login failed safely:", error);
+    if (!res.headersSent) res.status(503).json({ message: "Unable to authenticate right now." });
   });
 });
 
@@ -2588,6 +2600,9 @@ router.post("/forgetpwd", (req, res, next) => {
 router.post("/forgetpwdresetpwd", (req, res) => {
   const { patient_id, token, password } = req.body;
   const invalidLink = () => res.status(401).json({ message: "Invalid or expired reset link." });
+  if (!isPasswordValid(password)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+  }
   const numericId = Number(patient_id);
   if (!Number.isSafeInteger(numericId) || numericId <= 0 || typeof token !== "string" || !token || typeof password !== "string" || !password) {
     return invalidLink();
@@ -2808,3 +2823,4 @@ router.post("/:id", patientAccess(req => req.params.id), (req, res, next) => {
 });
 
 module.exports = router;
+

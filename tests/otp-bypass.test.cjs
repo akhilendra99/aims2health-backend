@@ -1,28 +1,28 @@
-const test = require('node:test');
+﻿const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const root = path.resolve(__dirname, '..');
 
 function loadHelperRouter({ failInsert = false } = {}) {
   const filename = path.join(root, 'routes/patient_helpers.js');
   const localRequire = createRequire(filename);
-  const sent = { phoneOtp: null, emailOtp: null };
+  const sent = { phoneOtp: null, emailOtp: null, emailText: null, storedPasswordHash: null };
   let clock = Date.now();
   class TestDate extends Date {
     constructor(...args) { super(...(args.length ? args : [clock])); }
     static now() { return clock; }
   }
   const db = {
-    async query(sql) {
+    async query(sql, values = []) {
       if (sql === 'SELECT 1') return [[{ ok: 1 }], []];
       if (/SELECT helper_id FROM helper_details/.test(sql)) return [[], []];
       if (/INSERT INTO helper_details/.test(sql)) {
         if (failInsert) throw new Error('fixture database failure');
+        sent.storedPasswordHash = values[2];
         return [{ insertId: 73 }, []];
       }
       throw new Error(`Unexpected fixture SQL: ${sql}`);
@@ -37,6 +37,7 @@ function loadHelperRouter({ failInsert = false } = {}) {
     return { data: { accepted: true } };
   } };
   const zeptomail = { sendMail: async message => {
+    sent.emailText = message.text;
     const match = String(message.text).match(/verification is: (\d{4})/);
     sent.emailOtp = match?.[1];
   } };
@@ -89,7 +90,7 @@ async function withServer(app, run) {
   }
 }
 
-test('helper registration requires purpose-bound, single-use OTP proofs before issuing a JWT', async t => {
+test('helper registration requires purpose-bound OTP proofs and does not establish a login session', async t => {
   const keys = ['JWT_SECRET_PATIENT', 'JWT_SECRET_DOC', 'JWT_SECRET_ADMIN'];
   const previous = keys.map(key => process.env[key]);
   process.env.JWT_SECRET_PATIENT = 'otp-helper-patient-fixture';
@@ -99,7 +100,7 @@ test('helper registration requires purpose-bound, single-use OTP proofs before i
 
   const { router, sent } = loadHelperRouter();
   await withServer(createApp(router), async request => {
-    const base = { email_id: 'helper-otp@test.invalid', phone_no: '5551234567', password: 'FixturePass123!' };
+    const base = { email_id: 'helper-otp@test.invalid', phone_no: '5551234567', password: 'FixPass1!' };
     const skipped = await request('POST', '/api/helper/register', { ...base, isVerified: true, role: 'admin' });
     assert.equal(skipped.status, 400);
     assert.equal(skipped.body.token, undefined);
@@ -113,6 +114,7 @@ test('helper registration requires purpose-bound, single-use OTP proofs before i
     })).status, 201);
     assert.match(sent.phoneOtp, /^\d{4}$/);
     assert.match(sent.emailOtp, /^\d{4}$/);
+    assert.match(sent.emailText, /valid for 8 minutes/i);
 
     const invalid = await request('POST', '/api/helper/verifyPhoneOTP', {
       phone: base.phone_no, countryCode: '1', otp: '0000', purpose: 'helper-registration',
@@ -154,8 +156,16 @@ test('helper registration requires purpose-bound, single-use OTP proofs before i
       emailVerificationToken: emailVerified.body.verificationToken,
     });
     assert.equal(registered.status, 201);
-    assert.equal(jwt.verify(registered.body.token, process.env.JWT_SECRET_PATIENT).role, 'helper');
-    assert.equal((await request('GET', '/helper-dashboard', undefined, registered.body.token)).status, 200, 'server-issued registration token authenticates helper dashboard');
+    assert.equal(registered.body.token, undefined, 'registration response does not expose or issue an access JWT');
+    assert.equal(registered.body.message, 'Helper registered successfully');
+    assert.equal(registered.body.helper_id, 73);
+    assert.deepEqual(registered.body.user, {
+      helper_id: 73, email_id: base.email_id, mobile: base.phone_no,
+    });
+    assert.equal(registered.headers.get('set-cookie'), null, 'registration does not authenticate the new account');
+    assert.notEqual(sent.storedPasswordHash, base.password);
+    assert.match(sent.storedPasswordHash, /^\$2[ab]\$12\$/);
+    assert.equal((await request('GET', '/helper-dashboard', undefined, registered.body.token)).status, 401, 'registration response cannot authenticate helper dashboard');
     assert.equal((await request('POST', '/api/helper/register', {
       ...base,
       phoneVerificationToken: phoneVerified.body.verificationToken,
@@ -174,7 +184,7 @@ test('expired helper OTP and registration database failure do not issue a sessio
 
   const fixture = loadHelperRouter({ failInsert: true });
   await withServer(createApp(fixture.router), async request => {
-    const body = { phone_no: '5559876543', password: 'FixturePass123!' };
+    const body = { phone_no: '5559876543', password: 'FixPass1!' };
     await request('POST', '/api/helper/sendPhoneVerifyOTP', { phone: body.phone_no, countryCode: '1', purpose: 'helper-registration' });
     fixture.advance(8 * 60 * 1000 + 1);
     const expired = await request('POST', '/api/helper/verifyPhoneOTP', {
@@ -195,3 +205,6 @@ test('expired helper OTP and registration database failure do not issue a sessio
     assert.equal((await request('GET', '/helper-dashboard')).status, 401);
   });
 });
+
+
+

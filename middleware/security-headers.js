@@ -20,9 +20,10 @@ const contentSecurityPolicy = {
   },
 };
 
-module.exports = helmet({
+const helmetMiddleware = helmet({
   contentSecurityPolicy,
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  // HSTS is applied below only after Express determines the request is secure.
+  hsts: false,
   frameguard: { action: "deny" },
   noSniff: true,
   hidePoweredBy: true,
@@ -30,3 +31,20 @@ module.exports = helmet({
   // delivery while preventing unrelated sites from embedding backend files.
   crossOriginResourcePolicy: { policy: "same-site" },
 });
+
+module.exports = function securityHeaders(req, res, next) {
+  // This backend serves dynamic APIs and access-controlled files, not public
+  // fingerprinted assets. Do not cache login, authenticated, or error bodies.
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  helmetMiddleware(req, res, error => {
+    if (error) return next(error);
+    if (req.secure) {
+      // Keep HSTS to this host until every subdomain has been verified for
+      // HTTPS. Do not enable includeSubDomains or preload from repo evidence.
+      res.setHeader("Strict-Transport-Security", "max-age=31536000");
+    } else {
+      res.removeHeader("Strict-Transport-Security");
+    }
+    next();
+  });
+};

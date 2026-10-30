@@ -132,7 +132,21 @@ test('real routes and parameterized MySQL ownership queries using connection-loc
     for(const name of ['patients','doctors','patient_helpers','admin']) {
       let connection=0, pool=0;
       const fakeMysql={createConnection:()=>connection++===0?callback:ehr, createPool:()=>({promise:()=>pool++===0?db:ehr})};
-      routers[name]=load('routes/'+name+'.js',{'mysql2':fakeMysql,'twilio':()=>({messages:{create:noExternal}}),'razorpay':function(){return {orders:{create:noExternal}};},'@sendgrid/mail':{setApiKey(){},send:noExternal},'axios':Object.assign(noExternal,{post:noExternal}),'../utils/zeptomail':{sendMail:noExternal},'needle':{post:noExternal}});
+      routers[name]=load('routes/'+name+'.js',{
+        'mysql2':fakeMysql,
+        '../utils/login-lockout': {
+          createLoginLockKeys: () => [],
+          isLoginLocked: async () => false,
+          recordLoginFailure: async () => {},
+          clearLoginFailures: async () => {},
+        },
+        'twilio':()=>({messages:{create:noExternal}}),
+        'razorpay':function(){return {orders:{create:noExternal}};},
+        '@sendgrid/mail':{setApiKey(){},send:noExternal},
+        'axios':Object.assign(noExternal,{post:noExternal}),
+        '../utils/zeptomail':{sendMail:noExternal},
+        'needle':{post:noExternal},
+      });
     }
     const app=express();app.use(express.json());app.use(require('cookie-parser')());
     const csrf=require('../middleware/csrf-protection');
@@ -173,6 +187,14 @@ test('real routes and parameterized MySQL ownership queries using connection-loc
           patientCsrf=csrfCookie.match(/^csrf_token=([^;]+)/)[1];
           patientCookie='auth_token='+issued+'; csrf_token='+patientCsrf;
           assert.equal((await request('GET','/api/patient/get-patients?id=1',undefined,undefined,{Cookie:patientCookie})).status,200,'patient cookie authenticates patient API');
+        } else if (role === 'admin') {
+          assert.equal(loginBody.token, undefined, 'admin JWT is only issued in the HttpOnly cookie');
+          const authCookie=login.headers.getSetCookie().find(value=>value.startsWith('auth_token='));
+          assert.ok(authCookie,'admin login sets HttpOnly auth cookie');
+          assert.match(authCookie,/; HttpOnly/i);
+          assert.match(authCookie,/; Secure/i);
+          assert.match(authCookie,/; SameSite=Lax/i);
+          issued=authCookie.match(/^auth_token=([^;]+)/)[1];
         } else {
           issued=loginBody.token;
         }
@@ -207,7 +229,7 @@ test('real routes and parameterized MySQL ownership queries using connection-loc
       }
       const p=sign('patient'),p2=sign('patient',2),d=sign('doctor'),h=sign('helper'),a=sign('admin');
       const downloaded=await request('GET','/images/'+fixtureName,p);
-      assert.equal(downloaded.status,200);assert.equal(downloaded.body,'authorization fixture');assert.equal(downloaded.headers.get('cache-control'),'private, no-store');
+      assert.equal(downloaded.status,200);assert.equal(downloaded.body,'authorization fixture');assert.equal(downloaded.headers.get('cache-control'),'no-store, no-cache, must-revalidate');
       assert.equal((await request('GET','/images/'+fixtureName,sign('patient',2))).status,404);
       assert.equal((await request('GET','/images/'+fixtureName)).status,401);
       assert.equal((await request('HEAD','/images/'+fixtureName,sign('patient',2))).status,404);

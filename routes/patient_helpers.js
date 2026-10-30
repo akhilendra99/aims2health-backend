@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const router = express.Router();
 const publicRecord = require("../utils/public-record");
 const mysql = require("mysql2");
@@ -19,6 +19,13 @@ const { authCookieOptions, csrfCookieOptions, clearCookieOptions, csrfClearCooki
 const { validateRequest, validateUploadedFile } = require("../middleware/validate-request");
 const { buildLimit } = require("../utils/pagination");
 const { comparePasswordOrDummy } = require("../utils/password-auth");
+const {
+  createLoginLockKeys,
+  isLoginLocked,
+  recordLoginFailure,
+  clearLoginFailures,
+} = require("../utils/login-lockout");
+const { isPasswordValid, generateInitialPassword, INVALID_PASSWORD_MESSAGE } = require("../utils/password-policy");
 
 const twilio_accountSid = process.env.TWILIO_AC_SID;
 const twilio_authToken = process.env.TWILIO_AUTHTOKEN;
@@ -29,8 +36,6 @@ const razorpay_instance = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-const passwordExpression =
-  /^(?=.*[0-9])(?=.*[!@#$%^&*])[a-zA-Z0-9!@#$%^&*]{8,16}$/;
 const emailInput = { type: "email", maxLength: 100, allowEmpty: true };
 const phoneInput = { type: "phone", maxLength: 30, pattern: /^\+?[\d\s().-]{7,30}$/, allowEmpty: true };
 const countryCodeInput = { type: "string", maxLength: 10, pattern: /^\+?\d{1,4}$/, allowEmpty: true };
@@ -106,8 +111,8 @@ const updateReportBodyInput = validateRequest({
 const changePasswordInput = validateRequest({
   body: {
     oldPassword: { type: "string", nonEmpty: true, maxBytes: 72 },
-    newPassword: { type: "string", nonEmpty: true, maxLength: 16, maxBytes: 72 },
-    confirmPassword: { type: "string", nonEmpty: true, maxLength: 16, maxBytes: 72 },
+    newPassword: { type: "string", nonEmpty: true, maxLength: 12, maxBytes: 72 },
+    confirmPassword: { type: "string", nonEmpty: true, maxLength: 12, maxBytes: 72 },
   },
   refine: ({ body }) => body.newPassword === body.confirmPassword
     ? []
@@ -142,7 +147,7 @@ const storage = multer.diskStorage({
     if (isValid) {
       error = null;
     }
-    // Absolute path (not cwd-dependent) with a self-healing mkdir — a
+    // Absolute path (not cwd-dependent) with a self-healing mkdir â€” a
     // bare relative "images" string broke when the process's cwd wasn't
     // the backend root, producing ENOENT on every upload.
     const uploadDir = path.join(__dirname, "..", "images");
@@ -151,7 +156,7 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, call_back) => {
     const ext = MIME_TYPE_MAP[file.mimetype];
-    // Strip anything but [a-z0-9] from the original filename — closes both
+    // Strip anything but [a-z0-9] from the original filename â€” closes both
     // the mojibake issue (e.g. macOS's narrow-no-break-space in screenshot
     // names surviving a naive .split(" ")) and path traversal via a
     // malicious originalname (e.g. "../../etc/passwd").
@@ -165,8 +170,8 @@ const storage = multer.diskStorage({
     call_back(null, safeName + "-" + Date.now() + "." + ext);
   },
 });
-// ✅ Define JWT secret & expiry
-// No hardcoded fallback — a guessable default secret is worse than failing
+// âœ… Define JWT secret & expiry
+// No hardcoded fallback â€” a guessable default secret is worse than failing
 // outright if JWT_SECRET_PATIENT is ever missing from the environment.
 const helperImageUpload = multer({
   storage,
@@ -323,14 +328,18 @@ router.post("/register", registerInput, async (req, res) => {
   try {
     const { email_id, phone_no, password, phoneVerificationToken, emailVerificationToken } = req.validatedRequest.body;
 
-    // 1️⃣ Validate: At least one identifier + password
+    if (!isPasswordValid(password)) {
+      return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+    }
+
+    // 1ï¸âƒ£ Validate: At least one identifier + password
     if ((!email_id && !phone_no) || !password) {
       return res
         .status(400)
         .json({ message: "Email or Phone and Password are required" });
     }
 
-    // 2️⃣ Validate Email Format (if provided)
+    // 2ï¸âƒ£ Validate Email Format (if provided)
     if (email_id) {
       const emailRegex = /^\S+@\S+\.\S+$/;
       if (!emailRegex.test(email_id)) {
@@ -338,7 +347,7 @@ router.post("/register", registerInput, async (req, res) => {
       }
     }
 
-    // 3️⃣ Clean and validate Phone (if provided)
+    // 3ï¸âƒ£ Clean and validate Phone (if provided)
     let cleanPhone = null;
     if (phone_no) {
       const rawPhone = String(phone_no).replace(/\D/g, ""); // Remove non-digits
@@ -356,7 +365,7 @@ router.post("/register", registerInput, async (req, res) => {
       return res.status(400).json({ message: "Email address must be verified with OTP before registration." });
     }
 
-    // 4️⃣ Check for existing user (by email OR phone)
+    // 4ï¸âƒ£ Check for existing user (by email OR phone)
     const conditions = [];
     const values = [];
 
@@ -388,32 +397,20 @@ router.post("/register", registerInput, async (req, res) => {
       return res.status(400).json({ message: "Email verification expired. Please verify again." });
     }
 
-    // 5️⃣ Hash password
+    // 5ï¸âƒ£ Hash password
     const hashedPwd = await bcrypt.hash(password, 12); // 12 is stronger than 11
 
-    // 6️⃣ Insert into DB
+    // 6ï¸âƒ£ Insert into DB
     const [insertResult] = await con.query(
       `INSERT INTO helper_details (email_id, mobile, hashed_pwd) 
        VALUES (?, ?, ?)`,
       [email_id || null, cleanPhone || null, hashedPwd],
     );
 
-    // 7️⃣ Generate JWT Token (optional: auto-login after register)
-    const token = jwt.sign(
-      {
-        helper_id: insertResult.insertId,
-        email_id: email_id || null,
-        mobile: cleanPhone || null,
-        role: "helper",
-      },
-      process.env.JWT_SECRET_PATIENT,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "7d" },
-    );
-
-    // 8️⃣ Success Response
+    // 7ï¸âƒ£ Generate JWT Token (optional: auto-login after register)
+    // 8ï¸âƒ£ Success Response
     return res.status(201).json({
       message: "Helper registered successfully",
-      token,
       helper_id: insertResult.insertId,
       user: {
         helper_id: insertResult.insertId,
@@ -431,7 +428,7 @@ router.post("/login", loginInput, async (req, res) => {
   try {
     const { email_id, phone_no, password } = req.validatedRequest.body;
 
-    // 1️⃣ Validate inputs
+    // 1ï¸âƒ£ Validate inputs
     if ((!email_id && !phone_no) || !password) {
       return res
         .status(400)
@@ -440,8 +437,16 @@ router.post("/login", loginInput, async (req, res) => {
 
     const field = email_id ? "email_id" : "mobile";
     const value = email_id || phone_no;
+    const identifierKeys = createLoginLockKeys({
+      identifier: value,
+      identifierType: email_id ? "email" : "phone",
+    });
 
-    // 2️⃣ Query user from DB
+    if (await isLoginLocked(con, identifierKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+
+    // 2ï¸âƒ£ Query user from DB
     const [results] = await con.query(
       `SELECT * FROM helper_details WHERE ${field} = ?`,
       [value],
@@ -449,8 +454,9 @@ router.post("/login", loginInput, async (req, res) => {
 
     if (results.length === 0) {
       await comparePasswordOrDummy(password, undefined, 12);
+      await recordLoginFailure(con, identifierKeys);
       // Deliberately identical status/message to the wrong-password branch
-      // below — a distinct "user does not exist" response lets an attacker
+      // below â€” a distinct "user does not exist" response lets an attacker
       // enumerate registered accounts by testing email/phone values.
       return res
         .status(401)
@@ -458,16 +464,31 @@ router.post("/login", loginInput, async (req, res) => {
     }
 
     const user = results[0];
+    const lockKeys = createLoginLockKeys({
+      identifier: value,
+      identifierType: email_id ? "email" : "phone",
+      role: "helper",
+      accountId: user.helper_id,
+    });
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
 
-    // 3️⃣ Compare password
+    // 3ï¸âƒ£ Compare password
     const isMatch = await comparePasswordOrDummy(password, user.hashed_pwd, 12);
     if (!isMatch) {
+      await recordLoginFailure(con, lockKeys);
       return res
         .status(401)
         .json({ message: "Invalid Authentication Credentials!" });
     }
 
-    // 4️⃣ Generate JWT token
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    await clearLoginFailures(con, lockKeys);
+
+    // 4ï¸âƒ£ Generate JWT token
     const token = jwt.sign(
       {
         helper_id: user.helper_id,
@@ -479,14 +500,13 @@ router.post("/login", loginInput, async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || "7d" },
     );
 
-    // 5️⃣ Send response
+    // 5ï¸âƒ£ Send response
     const helperCookieMaxAgeMs = 7 * 24 * 60 * 60 * 1000; // matches the 7d default above
     const csrfToken = generateCsrfToken();
     res.cookie("auth_token", token, authCookieOptions(helperCookieMaxAgeMs));
     res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions(helperCookieMaxAgeMs));
     return res.json({
       message: "Login successful",
-      token,
       user: {
         helper_id: user.helper_id,
         email_id: user.email_id,
@@ -495,7 +515,7 @@ router.post("/login", loginInput, async (req, res) => {
     });
   } catch (error) {
     console.error("Login Error:", error);
-    return res.status(500).json({ message: "Server error" });
+    return res.status(503).json({ message: "Unable to authenticate right now." });
   }
 });
 
@@ -543,11 +563,15 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
       mobile_no,
       mobile_secondary,
       sec_countryCode,
-      whatsapp_no, // ← NEW FIELD
+      whatsapp_no, // â† NEW FIELD
       phoneVerificationToken,
       emailVerificationToken,
       whatsappVerificationToken,
     } = req.validatedRequest.body;
+
+    if (password && !isPasswordValid(password)) {
+      return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+    }
 
     // Preserve the accepted legacy date, year-only, and age inputs after validation.
     const dobText = String(dob).trim();
@@ -557,16 +581,16 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
 
     // Require proof that mobile_no/email_id were actually OTP-verified in this
     // session before creating a patient record with them (VAPT L2 Finding 4,
-    // OTP Bypass — previously verifyPhoneOTP/verifyEmailOTP and add-patient
+    // OTP Bypass â€” previously verifyPhoneOTP/verifyEmailOTP and add-patient
     // were entirely unrelated API calls, so OTP verification could be skipped
     // outright with no effect on whether patient creation succeeded).
     //
-    // Two exceptions, both still secure — neither lets a caller introduce a
+    // Two exceptions, both still secure â€” neither lets a caller introduce a
     // brand-new, never-verified number/email:
     //  1. The helper's own contact info (decoded.* comes from a signed JWT
-    //     the caller can't forge) — e.g. adding themselves as a patient.
+    //     the caller can't forge) â€” e.g. adding themselves as a patient.
     //  2. Contact info already used by an existing patient under this same
-    //     helper — e.g. a parent's phone shared across their children's
+    //     helper â€” e.g. a parent's phone shared across their children's
     //     records. That number was already verified at least once to get
     //     onto the earlier patient record in the first place.
     // Phone is unconditionally required and must be verified. Email is
@@ -662,7 +686,13 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
     }
 
     const medical_history_val = medical_history.trim();
-    const finalPassword = password?.trim() ? password : "Test@3009";
+    // Helper-created patient records previously received a shared, known
+    // password when the UI omitted a password. Preserve that UI
+    // workflow while assigning a unique, unexposed initial credential.
+    const finalPassword = password || generateInitialPassword();
+    if (!isPasswordValid(finalPassword)) {
+      return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+    }
     const hashed_pwd = await bcrypt.hash(finalPassword, 10);
     const parent_id = helper_id || null;
     const today = new Date().toISOString().split("T")[0];
@@ -674,7 +704,7 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
       "LOCK TABLES pt_key WRITE, adm_new WRITE, casesheet WRITE",
     );
 
-    // 1. Insert into patient_details — ADD whatsapp_no
+    // 1. Insert into patient_details â€” ADD whatsapp_no
     const insertSql = `
       INSERT INTO patient_details 
       (abhaId, address, adhaar, countryCode, dob, ehr_id, email_id, fname, gender, hashed_pwd, 
@@ -702,7 +732,7 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
       mobile_secondary || null,
       parent_id,
       sec_countryCode || null,
-      whatsapp_no, // ← SAVED HERE
+      whatsapp_no, // â† SAVED HERE
     ]);
 
     const patientId = insertResult.insertId;
@@ -719,7 +749,7 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
       await ehrConn.query("UPDATE pt_key SET crno = 100");
     }
 
-    // 3. Insert into adm_new — you can add whatsapp_no here too if needed
+    // 3. Insert into adm_new â€” you can add whatsapp_no here too if needed
     await ehrConn.query(
       `INSERT INTO adm_new 
        (ma_name, lname, ma_address, Date_of_birth, Telno, cellno, sex, email, admno, vs_frontend, ma_dated, whatsapp_no)
@@ -736,7 +766,7 @@ router.post("/add-patient", addPatientInput, helperSession, async (req, res) => 
         crno,
         patientId,
         today,
-        whatsapp_no, // ← Also saved in adm_new (optional but recommended)
+        whatsapp_no, // â† Also saved in adm_new (optional but recommended)
       ],
     );
 
@@ -922,10 +952,9 @@ router.post("/change-password", helperSession, changePasswordInput, async (req, 
 
     const { oldPassword, newPassword, confirmPassword } = req.validatedRequest.body;
 
-    if (typeof newPassword !== "string" || !passwordExpression.test(newPassword)) {
+    if (!isPasswordValid(newPassword)) {
       return res.status(400).json({
-        message:
-          "Password must be 8-16 characters and include at least one number and one special character (!@#$%^&*).",
+        message: INVALID_PASSWORD_MESSAGE,
       });
     }
 
@@ -968,7 +997,7 @@ const otpStorePhone = new Map();
 
 // Verification proof tokens: issued once an OTP is actually confirmed, and
 // required by /register or /add-patient before it will accept that contact.
-// this, OTP verification and patient creation were two unrelated API calls —
+// this, OTP verification and patient creation were two unrelated API calls â€”
 // nothing stopped a caller from skipping straight to /add-patient with an
 // unverified phone/email (VAPT L2 Finding 4, OTP Bypass).
 const verifiedPhoneTokens = new Map();
@@ -1007,7 +1036,7 @@ function consumeVerificationToken(store, key, submittedToken) {
   return true;
 }
 
-// ✅ Helper: Validate phone numbers (only digits)
+// âœ… Helper: Validate phone numbers (only digits)
 function isValidPhone(number) {
   return /^[0-9]+$/.test(number);
 }
@@ -1027,7 +1056,7 @@ router.post("/sendPhoneVerifyOTP", async (req, res) => {
       });
     }
 
-    // Step 2: Clean phone – keep only last 10 digits
+    // Step 2: Clean phone â€“ keep only last 10 digits
     const rawPhone = String(phone).replace(/\D/g, ""); // Remove non-digits
     const cleanPhone = rawPhone.slice(-10); // Last 10 digits only
 
@@ -1060,7 +1089,7 @@ router.post("/sendPhoneVerifyOTP", async (req, res) => {
       expiresAt: Date.now() + 8 * 60 * 1000,
     });
 
-    // Step 5: SMS Payload – EXACTLY as you provided
+    // Step 5: SMS Payload â€“ EXACTLY as you provided
     const payload = {
       user: "LH_Aims",
       password: "Aims@789",
@@ -1140,7 +1169,7 @@ router.post("/sendPhoneVerifyOTP", async (req, res) => {
           message: waErr.message,
           status: waErr.response?.status,
         });
-        // Intentionally not throwing — SMS is primary channel
+        // Intentionally not throwing â€” SMS is primary channel
       });
     // === WHATSAPP INTEGRATION ENDS HERE ===
 
@@ -1168,7 +1197,7 @@ router.post("/sendPhoneVerifyOTP", async (req, res) => {
   }
 });
 
-// ✅ VERIFY OTP
+// âœ… VERIFY OTP
 router.post("/verifyPhoneOTP", async (req, res) => {
   let { phone, countryCode, otp } = req.body;
   const purpose = getOtpPurpose(req.body.purpose);
@@ -1213,7 +1242,7 @@ router.post("/verifyPhoneOTP", async (req, res) => {
     return res.status(400).json({ message: "Invalid or expired OTP" });
   }
 
-  // OTP is correct → clean up
+  // OTP is correct â†’ clean up
   otpStorePhone.delete(challengeKey);
 
   const verificationToken = issueVerificationToken(verifiedPhoneTokens, challengeKey);
@@ -1276,7 +1305,7 @@ router.post("/sendEmailVerifyOTP", async (req, res) => {
       expiresAt: Date.now() + 8 * 60 * 1000, // 8 minutes
     });
 
-    // Step 4: Send OTP via ZeptoMail — services.netxcell.com:8081 (the
+    // Step 4: Send OTP via ZeptoMail â€” services.netxcell.com:8081 (the
     // previous provider) is unreachable (confirmed independently from
     // multiple networks, not an EC2-specific firewall issue). VAPT L1
     // Finding 15 / L2 Finding 18, "Broken Functionality".
@@ -1284,10 +1313,10 @@ router.post("/sendEmailVerifyOTP", async (req, res) => {
       await zeptomail.sendMail({
         to: emailToSend,
         subject: "Your AIMS2Health OTP for Email Verification",
-        text: `Dear User,\n\nYour OTP for email verification is: ${otp}\n\nThis OTP is valid for 10 minutes only.\n\nThank you,\nAIMS2Health Team`,
+        text: `Dear User,\n\nYour OTP for email verification is: ${otp}\n\nThis OTP is valid for 8 minutes only.\n\nThank you,\nAIMS2Health Team`,
         html: `<p>Dear User,</p>
              <p>Your OTP for email verification is: <strong>${otp}</strong></p>
-             <p><strong>Valid for 10 minutes only.</strong></p>
+             <p><strong>Valid for 8 minutes only.</strong></p>
              <p>Thank you,<br><strong>AIMS2Health Team</strong></p>`,
       });
 
@@ -1420,13 +1449,13 @@ router.post(
       if (req.file) {
         imagePath = urlLive + "/images/" + req.file.filename;
 
-        // Use req.file.path (multer already gives full path) — safer than building it
+        // Use req.file.path (multer already gives full path) â€” safer than building it
         const fileInfo = fs.statSync(req.file.path);
         mediaSize = fileInfo.size; // in bytes
 
         mediaType = submittedMediaType?.trim() || "Unknown";
       }
-      // Case 2: No file → keep 'na' and 0
+      // Case 2: No file â†’ keep 'na' and 0
 
       // Upload limit logic
       const [countRows] = await con.query(
@@ -1571,7 +1600,7 @@ router.post("/update-consent", validateRequest({ body: { patient_id: { type: "id
     }
     const username = userRows[0].name;
 
-    // Send via ZeptoMail — services.netxcell.com:8081 (the previous
+    // Send via ZeptoMail â€” services.netxcell.com:8081 (the previous
     // provider) is unreachable. VAPT L1 Finding 15 / L2 Finding 18,
     // "Broken Functionality".
     try {
@@ -1611,7 +1640,7 @@ router.post("/forgetpwd", validateRequest({ body: { email: { type: "email", requ
     const sql = `SELECT * FROM helper_details WHERE email_id = ?`;
     const [result] = await con.query(sql, [email]);
 
-    // If email NOT found → Show error
+    // If email NOT found â†’ Show error
     if (!result || result.length === 0) {
       return res.status(200).json({
         success: true,
@@ -1622,7 +1651,7 @@ router.post("/forgetpwd", validateRequest({ body: { email: { type: "email", requ
     const user = result[0];
 
     // Was a hardcoded literal (a copy of JWT_SECRET_PATIENT baked into
-    // source) — moved to env so it tracks secret rotation and isn't
+    // source) â€” moved to env so it tracks secret rotation and isn't
     // exposed via code shared externally (e.g. the VAPT auditor zip).
     // Must stay consistent with the verify side in routes/patients.js's
     // /forgetpwdresetpwd handler.
@@ -1636,7 +1665,7 @@ router.post("/forgetpwd", validateRequest({ body: { email: { type: "email", requ
 
     const link = `${process.env.FRONTEND_URL}/presetpwd/${user.helper_id}/${token}`;
 
-    // Send via ZeptoMail — services.netxcell.com:8081 (the previous
+    // Send via ZeptoMail â€” services.netxcell.com:8081 (the previous
     // provider) is unreachable (confirmed independently from multiple
     // networks, not an EC2-specific firewall issue). VAPT L1 Finding 15 /
     // L2 Finding 18, "Broken Functionality".
@@ -1729,7 +1758,7 @@ router.put(
 
         mediaType = submittedMediaType?.trim() || "Unknown";
       }
-      // If no file → keep 'na' values
+      // If no file â†’ keep 'na' values
 
       // Update query
       const updateSql = `
@@ -1757,7 +1786,7 @@ router.put(
       ]);
 
       if (result.affectedRows === 0) {
-        // If file was uploaded but record not found → delete file
+        // If file was uploaded but record not found â†’ delete file
         if (req.file && fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
         }
@@ -1847,3 +1876,4 @@ router.post("/logout", helperSession, (req, res) => {
 });
 
 module.exports = router;
+

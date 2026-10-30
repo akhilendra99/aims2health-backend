@@ -4,6 +4,13 @@ const publicRecord = require("../utils/public-record");
 const mysql = require("mysql2");
 const bcrypt = require("bcryptjs");
 const { comparePasswordOrDummy } = require("../utils/password-auth");
+const {
+  createLoginLockKeys,
+  isLoginLocked,
+  recordLoginFailure,
+  clearLoginFailures,
+} = require("../utils/login-lockout");
+const { isPasswordValid, INVALID_PASSWORD_MESSAGE } = require("../utils/password-policy");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const multer = require("multer");
@@ -30,8 +37,6 @@ sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 // regular expressions for input validation (same policy as patients.js)
 const emailExpression = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-const passwordExpression =
-  /^(?=.*[0-9])(?=.*[!@#$%^&*])[a-zA-Z0-9!@#$%^&*]{8,16}$/;
 const phoneExpression = /^\d{10}$/;
 
 const MIME_TYPE_MAP = {
@@ -431,11 +436,8 @@ router.get("/patientDetails/:id", calendarAccess(req => req.params.id), (req, re
 // })
 
 router.put("/chpwd", doctorSession, (req, res, next) => {
-  if (!passwordExpression.test(req.body.newpwd)) {
-    return res.status(400).json({
-      message:
-        "Password must be 8-16 characters and include at least one number and one special character (!@#$%^&*).",
-    });
+  if (typeof req.body?.oldpwd !== "string" || !req.body.oldpwd || Buffer.byteLength(req.body.oldpwd, "utf8") > 72 || !isPasswordValid(req.body.newpwd)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
   }
 
   var sql = `SELECT * FROM doctor_details WHERE doctor_id= ?`;
@@ -702,7 +704,9 @@ router.post("/schedule", doctorSession, (req, res, next) => {
 });
 
 router.post("/signup", (req, res, next) => {
-  console.log(req.body);
+  if (!isPasswordValid(req.body?.password)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+  }
 
   if (!emailExpression.test(req.body.email)) {
     return res.status(400).json({ message: "Invalid email address." });
@@ -710,13 +714,6 @@ router.post("/signup", (req, res, next) => {
   if (!phoneExpression.test(req.body.mobile_no)) {
     return res.status(400).json({ message: "Mobile number must be 10 digits." });
   }
-  if (!passwordExpression.test(req.body.password)) {
-    return res.status(400).json({
-      message:
-        "Password must be 8-16 characters and include at least one number and one special character (!@#$%^&*).",
-    });
-  }
-
   con.query(
     `SELECT * FROM doctor_details WHERE email_id = ?`,
     [req.body.email],
@@ -783,60 +780,52 @@ router.post("/signup", (req, res, next) => {
   );
 });
 
-router.post("/login", (req, res, next) => {
-  var sql = `SELECT * FROM doctor_details WHERE email_id= ?`;
-
-  con.query(sql, [req.body.email], function (err, result, fields) {
-    if (err) {
-      res.status(401).json({
-        message: "Invalid Authentication Credentials!",
-      });
-    } else {
-        if (result.length <= 0) {
-          comparePasswordOrDummy(req.body.password, undefined, 11).then(() => {
-            res.status(401).json({ message: "Invalid Authentication Credentials!" });
-          }).catch(() => res.status(401).json({ message: "Invalid Authentication Credentials!" }));
-        } else if (result[0].validated == 1) {
-          comparePasswordOrDummy(req.body.password, result[0].hashed_pwd, 11)
-            .then((auth_result) => {
-              if (!auth_result) {
-                res.status(401).json({
-                  message: "Invalid Authentication Credentials!",
-                });
-              } else {
-                const token = jwt.sign(
-                  {
-                    email: result[0].email_id,
-                    userId: result[0].doctor_id,
-                    role: "doctor",
-                  },
-                  "" + process.env.JWT_SECRET_DOC,
-                  { expiresIn: "1h" },
-                );
-                const csrfToken = generateCsrfToken();
-                res.cookie("auth_token", token, authCookieOptions());
-                res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
-                res.status(200).json({
-                  token: token,
-                  expiresIn: 3600,
-                  userId: +result[0].doctor_id,
-                  userEmail: "" + result[0].email_id,
-                  userName: result[0].fname + " " + result[0].lname,
-                });
-              }
-            })
-            .catch((err) => {
-              res.status(401).json({
-                message: "Invalid Authentication Credentials!",
-              });
-            });
-          // Keep approval state private and perform the same password work.
-        } else {
-          comparePasswordOrDummy(req.body.password, undefined, 11).then(() => {
-            res.status(401).json({ message: "Invalid Authentication Credentials!" });
-          }).catch(() => res.status(401).json({ message: "Invalid Authentication Credentials!" }));
-        }
-      }
+router.post("/login", (req, res) => {
+  (async () => {
+    const identifierKeys = createLoginLockKeys({ identifier: req.body?.email, identifierType: "email" });
+    if (await isLoginLocked(con, identifierKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const result = await new Promise((resolve, reject) => {
+      con.query("SELECT * FROM doctor_details WHERE email_id = ?", [req.body?.email], (err, rows) => err ? reject(err) : resolve(rows));
+    });
+    if (result.length <= 0) {
+      await comparePasswordOrDummy(req.body?.password, undefined, 11);
+      await recordLoginFailure(con, identifierKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const user = result[0];
+    const lockKeys = createLoginLockKeys({ identifier: req.body?.email, role: "doctor", accountId: user.doctor_id });
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const eligible = user.validated == 1;
+    const authResult = await comparePasswordOrDummy(req.body?.password, eligible ? user.hashed_pwd : undefined, 11);
+    if (!eligible || !authResult) {
+      await recordLoginFailure(con, lockKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    await clearLoginFailures(con, lockKeys);
+    const token = jwt.sign(
+      { email: user.email_id, userId: user.doctor_id, role: "doctor" },
+      "" + process.env.JWT_SECRET_DOC,
+      { expiresIn: "1h" },
+    );
+    const csrfToken = generateCsrfToken();
+    res.cookie("auth_token", token, authCookieOptions());
+    res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
+    return res.status(200).json({
+      expiresIn: 3600,
+      userId: +user.doctor_id,
+      userEmail: "" + user.email_id,
+      userName: user.fname + " " + user.lname,
+    });
+  })().catch(error => {
+    console.error("Doctor login failed safely:", error);
+    if (!res.headersSent) res.status(503).json({ message: "Unable to authenticate right now." });
   });
 });
 
@@ -1341,6 +1330,9 @@ router.post("/forgetpwd", (req, res, next) => {
 });
 
 router.post("/forgetpwdresetpwd", (req, res, next) => {
+  if (!isPasswordValid(req.body?.password)) {
+    return res.status(400).json({ message: INVALID_PASSWORD_MESSAGE });
+  }
   //var sql = `SELECT * FROM patient_details WHERE email_id= '${req.body.email}'`;
   var sql = `SELECT * FROM doctor_details WHERE doctor_id= ?`;
 

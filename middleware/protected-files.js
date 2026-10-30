@@ -13,7 +13,7 @@ module.exports = function protectedFiles() {
   const router = express.Router();
   router.use(access.guard(['patient', 'helper', 'doctor', 'admin']));
   router.use((req, res, next) => {
-    res.set('Cache-Control', 'private, no-store');
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     if (!['GET', 'HEAD'].includes(req.method)) return res.status(405).json({ message: 'Method not allowed.' });
     next();
   });

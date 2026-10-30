@@ -3,6 +3,12 @@ const router = express.Router();
 const mysql = require("mysql2");
 const bcrypt = require("bcryptjs");
 const { comparePasswordOrDummy } = require("../utils/password-auth");
+const {
+  createLoginLockKeys,
+  isLoginLocked,
+  recordLoginFailure,
+  clearLoginFailures,
+} = require("../utils/login-lockout");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const multer = require("multer");
@@ -85,58 +91,51 @@ con.connect(function (err) {
 const authorization = require('../utils/authorization')((sql, values) => new Promise((resolve, reject) => con.query(sql, values, (err, rows) => err ? reject(err) : resolve(rows))));
 const adminSession = authorization.guard(['admin']);
 
-router.post("/login", (req, res, next) => {
-  var sql = `SELECT * FROM admin_details WHERE email_id= ?`;
-  //console.log(req.body)
-  con.query(sql, [req.body.email], function (err, result, fields) {
-    if (err) {
-      res.status(401).json({
-        message: "Invalid Authentication Credentials!",
-      });
-    } else {
-      if (result.length <= 0) {
-        comparePasswordOrDummy(req.body.password, undefined, 11).then(() => {
-          res.status(401).json({ message: "Invalid Authentication Credentials!" });
-        }).catch(() => res.status(401).json({ message: "Invalid Authentication Credentials!" }));
-      } else {
-        comparePasswordOrDummy(req.body.password, result[0].hashed_pwd, 11)
-          .then((auth_result) => {
-            console.log("auth_result: ", auth_result);
-            if (!auth_result) {
-              res.status(401).json({
-                message: "Invalid Authentication Credentials!",
-              });
-            } else {
-              const token = jwt.sign(
-                {
-                  email: result[0].email_id,
-                  userId: result[0].admin_id,
-                  role: "admin",
-                },
-                "" + process.env.JWT_SECRET_ADMIN,
-                { expiresIn: "1h" }
-              );
-              const csrfToken = generateCsrfToken();
-              res.cookie("auth_token", token, authCookieOptions());
-              res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
-              res.status(200).json({
-                token: token,
-                expiresIn: 3600,
-                userId: +result[0].admin_id,
-                Useremail: result[0].email_id,
-                userName: result[0].email_id,
-              });
-            }
-          })
-          .catch((err) => {
-            console.log("This error: ", err);
-            res.status(401).json({
-              message: "Invalid Authentication Credentials!",
-            });
-          });
-        //res.status(200).json(result[0].email);
-      }
+router.post("/login", (req, res) => {
+  (async () => {
+    const identifierKeys = createLoginLockKeys({ identifier: req.body?.email, identifierType: "email" });
+    if (await isLoginLocked(con, identifierKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
     }
+    const result = await new Promise((resolve, reject) => {
+      con.query("SELECT * FROM admin_details WHERE email_id = ?", [req.body?.email], (err, rows) => err ? reject(err) : resolve(rows));
+    });
+    if (result.length <= 0) {
+      await comparePasswordOrDummy(req.body?.password, undefined, 11);
+      await recordLoginFailure(con, identifierKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const user = result[0];
+    const lockKeys = createLoginLockKeys({ identifier: req.body?.email, role: "admin", accountId: user.admin_id });
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    const authResult = await comparePasswordOrDummy(req.body?.password, user.hashed_pwd, 11);
+    if (!authResult) {
+      await recordLoginFailure(con, lockKeys);
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    if (await isLoginLocked(con, lockKeys)) {
+      return res.status(401).json({ message: "Invalid Authentication Credentials!" });
+    }
+    await clearLoginFailures(con, lockKeys);
+    const token = jwt.sign(
+      { email: user.email_id, userId: user.admin_id, role: "admin" },
+      "" + process.env.JWT_SECRET_ADMIN,
+      { expiresIn: "1h" },
+    );
+    const csrfToken = generateCsrfToken();
+    res.cookie("auth_token", token, authCookieOptions());
+    res.cookie(CSRF_COOKIE, csrfToken, csrfCookieOptions());
+    return res.status(200).json({
+      expiresIn: 3600,
+      userId: +user.admin_id,
+      Useremail: user.email_id,
+      userName: user.email_id,
+    });
+  })().catch(error => {
+    console.error("Admin login failed safely:", error);
+    if (!res.headersSent) res.status(503).json({ message: "Unable to authenticate right now." });
   });
 });
 

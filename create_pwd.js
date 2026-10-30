@@ -1,17 +1,21 @@
 const bcrypt = require('bcryptjs');
+const { isPasswordValid } = require('./utils/password-policy');
 
-let tryPwd = "admin12@aims2@health"
+const tryPwd = process.env.INITIAL_ADMIN_PASSWORD;
 
-function generatePwdHash(){
-    bcrypt.hash(tryPwd, 11)
-    .then(hash => {
-        console.log("raw pwd: ", tryPwd);
-        console.log("hash: ", hash);
-        
-    })
-    .catch( err =>{
-    console.log("error:", err);
-    });
+async function generatePwdHash() {
+  if (!isPasswordValid(tryPwd)) {
+    process.stderr.write('Set INITIAL_ADMIN_PASSWORD to a password that meets the application policy.\n');
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const hash = await bcrypt.hash(tryPwd, 11);
+    process.stdout.write(`${hash}\n`);
+  } catch (_) {
+    process.stderr.write('Password hash generation failed.\n');
+    process.exitCode = 1;
+  }
 }
 
-generatePwdHash(tryPwd);
+generatePwdHash();

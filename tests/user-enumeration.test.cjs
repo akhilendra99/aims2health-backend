@@ -14,17 +14,58 @@ const knownPhone = "5551234567";
 
 function makeDatabase(users) {
   const calls = [];
+  const loginLockoutRows = new Map();
+  let databaseNow = Date.now();
+  let failLoginLockoutStore = false;
   users.createdPatients = [];
   async function rowsFor(sql, values = []) {
     calls.push({ sql, values });
     const normalized = sql.replace(/\s+/g, " ").trim().toLowerCase();
     const value = values[0];
+    if (normalized.includes("login_lockout_state") && failLoginLockoutStore) {
+      throw new Error("fixture lockout store failure");
+    }
     if (normalized.startsWith("insert into patient_details")) {
       const created = { patient_id: 2, helper_id: values[0], email_id: values[13], hashed_pwd: values[14] };
       users.createdPatients.push(created);
       return { insertId: created.patient_id, affectedRows: 1 };
     }
     if (normalized.startsWith("insert into patient_additional")) return { affectedRows: 1 };
+    if (normalized.startsWith("select lock_key from login_lockout_state")) {
+      return values.filter(key => (loginLockoutRows.get(key)?.lockedUntil || 0) > databaseNow).map(lock_key => ({ lock_key }));
+    }
+    if (normalized.startsWith("insert into login_lockout_state")) {
+      const [key, retentionSeconds, windowSeconds, threshold, lockSeconds] = values;
+      const previous = loginLockoutRows.get(key);
+      if (!previous) {
+        loginLockoutRows.set(key, {
+          windowStartedAt: databaseNow,
+          failedAttempts: 1,
+          lockedUntil: 0,
+          expiresAt: databaseNow + retentionSeconds * 1000,
+        });
+      } else if (previous.lockedUntil <= databaseNow) {
+        if (previous.windowStartedAt <= databaseNow - windowSeconds * 1000) {
+          previous.windowStartedAt = databaseNow;
+          previous.failedAttempts = 1;
+          previous.lockedUntil = 0;
+        } else {
+          previous.failedAttempts += 1;
+          if (previous.failedAttempts >= threshold) previous.lockedUntil = databaseNow + lockSeconds * 1000;
+        }
+        previous.expiresAt = databaseNow + retentionSeconds * 1000;
+      }
+      return { affectedRows: 1 };
+    }
+    if (normalized.startsWith("delete from login_lockout_state where lock_key in")) {
+      let affectedRows = 0;
+      for (const key of values) affectedRows += loginLockoutRows.delete(key) ? 1 : 0;
+      return { affectedRows };
+    }
+    if (normalized.startsWith("delete from login_lockout_state where expires_at")) {
+      for (const [key, row] of loginLockoutRows) if (row.expiresAt <= databaseNow) loginLockoutRows.delete(key);
+      return { affectedRows: 0 };
+    }
     if (normalized.startsWith("select crno from pt_key")) return [{ crno: 100 }];
     if (normalized === "select 1") return [{ ok: 1 }];
     if (normalized.includes("from helper_details") && normalized.includes("where mobile = ?")) {
@@ -39,7 +80,7 @@ function makeDatabase(users) {
     if (normalized.includes("from helper_details") && normalized.includes("where helper_id = ?")) {
       return String(value) === "1" ? [users.helper] : [];
     }
-    if (normalized.includes("from patient_details") && normalized.includes("where patient_id = ?")) {
+    if (normalized.includes("from patient_details") && normalized.includes("where patient_id")) {
       return String(value) === String(users.patient.patient_id) ? [users.patient] : [];
     }
     if (normalized.includes("from patient_details") && normalized.includes("where email_id")) {
@@ -64,6 +105,14 @@ function makeDatabase(users) {
       users.helper.hashed_pwd = values[0];
       return { affectedRows: 1 };
     }
+    if (normalized.startsWith("update doctor_details set adhaar")) {
+      users.doctor.createdHash = values[2];
+      return { affectedRows: 1 };
+    }
+    if (normalized.startsWith("update doctor_details set hashed_pwd = ?")) {
+      users.doctor.hashed_pwd = values[0];
+      return { affectedRows: 1 };
+    }
     if (normalized.startsWith("update doctor_details")) return { affectedRows: 1 };
     return [];
   }
@@ -80,6 +129,8 @@ function makeDatabase(users) {
   };
   return {
     calls,
+    advanceTime: milliseconds => { databaseNow += milliseconds; },
+    setLoginLockoutFailure: value => { failLoginLockoutStore = value; },
     mysql: {
       createConnection: () => callbackConnection,
       createPool: () => ({ promise: () => promiseConnection }),
@@ -132,11 +183,12 @@ async function serve(app, run) {
 }
 
 test("login, recovery, existence checks, and registration responses do not disclose account state", async t => {
-  const envKeys = ["JWT_SECRET_PATIENT", "JWT_SECRET_DOC", "JWT_SECRET_ADMIN", "FRONTEND_URL", "EHR_CONNECT", "COOKIE_SECURE", "COOKIE_DOMAIN"];
+  const envKeys = ["JWT_SECRET_PATIENT", "JWT_SECRET_DOC", "JWT_SECRET_ADMIN", "LOGIN_LOCKOUT_SECRET", "FRONTEND_URL", "EHR_CONNECT", "COOKIE_SECURE", "COOKIE_DOMAIN"];
   const previous = envKeys.map(key => process.env[key]);
   process.env.JWT_SECRET_PATIENT = "enum-test-patient-secret";
   process.env.JWT_SECRET_DOC = "enum-test-doctor-secret";
   process.env.JWT_SECRET_ADMIN = "enum-test-admin-secret";
+  process.env.LOGIN_LOCKOUT_SECRET = "user-enumeration-lockout-secret-fixture-2026";
   process.env.FRONTEND_URL = "https://frontend.test.invalid";
   process.env.EHR_CONNECT = "false";
   process.env.COOKIE_SECURE = "true";
@@ -177,6 +229,7 @@ test("login, recovery, existence checks, and registration responses do not discl
     admin: loadRouter("routes/admin.js", common),
   };
   const app = express();
+  app.set("trust proxy", 1);
   app.use(express.json());
   app.use(require("cookie-parser")());
   const csrf = require("../middleware/csrf-protection");
@@ -202,7 +255,7 @@ test("login, recovery, existence checks, and registration responses do not discl
       const goodBody = role === "helper"
         ? { email_id: knownEmail, password: "ValidPass1!" }
         : { email: knownEmail, password: "ValidPass1!" };
-      const success = await request("POST", base, goodBody, { includeHeaders: role === "patient" });
+      const success = await request("POST", base, goodBody, { includeHeaders: ["patient", "doctor", "helper", "admin"].includes(role) });
       assert.equal(success.status, 200, `${role} successful login remains intact`);
       if (role === "patient") {
         assert.deepEqual(success.body, {
@@ -239,10 +292,125 @@ test("login, recovery, existence checks, and registration responses do not discl
           headers: { Cookie: "auth_token=" + cookieToken },
         });
         assert.equal(afterLogout.status, 401, "logout revokes the cookie-issued patient token");
+      } else if (role === "admin") {
+        assert.equal(success.body.token, undefined, "admin JWT is not exposed in JavaScript-readable JSON");
+        assert.equal(success.body.userId, 1, "admin UI identity contract remains intact");
+        const authCookie = success.headers.getSetCookie().find(value => value.startsWith("auth_token="));
+        assert.ok(authCookie, "admin login still issues an HttpOnly authentication cookie");
+        assert.match(authCookie, /; HttpOnly/i);
+      } else if (role === "doctor") {
+        assert.equal(success.body.token, undefined, "doctor JWT is not exposed in JavaScript-readable JSON");
+        assert.equal(success.body.userId, 1);
+        assert.equal(success.body.userEmail, knownEmail);
+        assert.equal(success.body.userName, "Test Doctor");
+        const authCookie = success.headers.getSetCookie().find(value => value.startsWith("auth_token="));
+        assert.ok(authCookie, "doctor login still sets its HttpOnly authentication cookie");
+        assert.match(authCookie, /; HttpOnly/i);
+      } else if (role === "helper") {
+        assert.equal(success.body.token, undefined, "helper JWT is not exposed in JavaScript-readable JSON");
+        assert.deepEqual(success.body.user, {
+          helper_id: 1, email_id: knownEmail, mobile: knownPhone,
+        }, "helper profile response remains compatible with current Angular login");
+        const authCookie = success.headers.getSetCookie().find(value => value.startsWith("auth_token="));
+        assert.ok(authCookie, "helper login still sets its HttpOnly authentication cookie");
+        assert.match(authCookie, /; HttpOnly/i);
       } else {
         assert.ok(success.body.token, `${role} successful login still issues a token`);
       }
     }
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const failed = await request("POST", "/api/patient/login", { email: knownEmail, password: "WrongPass1!" });
+      assert.equal(failed.status, 401);
+    }
+    const resetBySuccess = await request("POST", "/api/patient/login", { email: knownEmail, password: "ValidPass1!" });
+    assert.equal(resetBySuccess.status, 200, "successful login clears identifier/account failures");
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const failed = await request("POST", "/api/patient/login", { email: knownEmail, password: "WrongPass1!" }, {
+        headers: { "X-Forwarded-For": `192.0.2.${attempt + 1}` },
+      });
+      assert.deepEqual(failed, { status: 401, body: { message: "Invalid Authentication Credentials!" } });
+    }
+    const crossRoleLock = await request("POST", "/api/doctor/login", { email: knownEmail, password: "ValidPass1!" }, {
+      headers: { "X-Forwarded-For": "198.51.100.44" },
+    });
+    assert.deepEqual(crossRoleLock, { status: 401, body: { message: "Invalid Authentication Credentials!" } },
+      "identifier lockout applies through alternate role login endpoints");
+    database.advanceTime(15 * 60 * 1000 + 1);
+    const afterExpiry = await request("POST", "/api/patient/login", { email: knownEmail, password: "ValidPass1!" });
+    assert.equal(afterExpiry.status, 200, "temporary lockout expires and successful login works again");
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const failed = await request("POST", "/api/helper/login", { phone_no: knownPhone, password: "WrongPass1!" });
+      assert.equal(failed.status, 401);
+    }
+    const helperAliasLock = await request("POST", "/api/helper/login", { email_id: knownEmail, password: "ValidPass1!" });
+    assert.deepEqual(helperAliasLock, { status: 401, body: { message: "Invalid Authentication Credentials!" } },
+      "helper email and phone aliases share server-resolved account state");
+    database.advanceTime(15 * 60 * 1000 + 1);
+    const helperAfterExpiry = await request("POST", "/api/helper/login", { email_id: knownEmail, password: "ValidPass1!" });
+    assert.equal(helperAfterExpiry.status, 200);
+
+    const weakSignupCases = [
+      ["/api/helper/register", { email_id: "new-user@test.invalid", password: "Weak123" }],
+      ["/api/patient/signup", { password: "Weak123" }],
+      ["/api/doctor/signup", { password: "Weak123" }],
+    ];
+    const beforeWeakSignups = database.calls.length;
+    for (const [route, body] of weakSignupCases) {
+      const result = await request("POST", route, body);
+      assert.equal(result.status, 400, `${route} rejects a weak password`);
+      assert.match(result.body.message, /8-12 ASCII characters/);
+    }
+    assert.equal(database.calls.length, beforeWeakSignups, "weak signup input is rejected before database work");
+
+    const patientSession = jwt.sign({ userId: 1, role: "patient", email: knownEmail }, process.env.JWT_SECRET_PATIENT, { expiresIn: "1h" });
+    const doctorSession = jwt.sign({ userId: 1, role: "doctor", email: knownEmail }, process.env.JWT_SECRET_DOC, { expiresIn: "1h" });
+    const helperSession = jwt.sign({ helper_id: 1, role: "helper", email_id: knownEmail }, process.env.JWT_SECRET_PATIENT, { expiresIn: "1h" });
+    const weakChangeCases = [
+      ["PUT", "/api/patient/chpwd", patientSession, { oldpwd: "ValidPass1!", newpwd: "Weak123" }],
+      ["PUT", "/api/doctor/chpwd", doctorSession, { oldpwd: "ValidPass1!", newpwd: "Weak123" }],
+      ["POST", "/api/helper/change-password", helperSession, { oldPassword: "ValidPass1!", newPassword: "Weak123", confirmPassword: "Weak123" }],
+    ];
+    for (const [method, route, token, body] of weakChangeCases) {
+      const result = await request(method, route, body, { headers: { Authorization: `Bearer ${token}` } });
+      assert.equal(result.status, 400, `${route} rejects a weak new password`);
+    }
+    const currentPasswordCases = [
+      ["PUT", "/api/patient/chpwd", patientSession, { oldpwd: "WrongOld1!", newpwd: "Change1!" }],
+      ["PUT", "/api/doctor/chpwd", doctorSession, { oldpwd: "WrongOld1!", newpwd: "Change1!" }],
+      ["POST", "/api/helper/change-password", helperSession, { oldPassword: "WrongOld1!", newPassword: "Change1!", confirmPassword: "Change1!" }],
+    ];
+    for (const [method, route, token, body] of currentPasswordCases) {
+      const result = await request(method, route, body, { headers: { Authorization: `Bearer ${token}` } });
+      assert.ok(result.status === 401 || result.status === 500, `${route} requires the current password`);
+    }
+    const validPasswordChanges = [
+      ["PUT", "/api/patient/chpwd", patientSession, { oldpwd: "ValidPass1!", newpwd: "Change1!" }],
+      ["PUT", "/api/doctor/chpwd", doctorSession, { oldpwd: "ValidPass1!", newpwd: "Change1!" }],
+      ["POST", "/api/helper/change-password", helperSession, { oldPassword: "ValidPass1!", newPassword: "Change1!", confirmPassword: "Change1!" }],
+    ];
+    for (const [method, route, token, body] of validPasswordChanges) {
+      const result = await request(method, route, body, { headers: { Authorization: `Bearer ${token}` } });
+      assert.ok(result.status === 200 || result.status === 201, `${route} accepts a valid change with the current password`);
+    }
+    const wrongRolePasswordChange = await request("PUT", "/api/patient/chpwd", {
+      oldpwd: "Change1!", newpwd: "Change2!",
+    }, { headers: { Authorization: `Bearer ${helperSession}` } });
+    assert.ok(wrongRolePasswordChange.status === 401 || wrongRolePasswordChange.status === 403,
+      "a helper token cannot change a patient password");
+    for (const account of [users.patient, users.doctor, users.helper]) {
+      assert.equal(await bcrypt.compare("Change1!", account.hashed_pwd), true, "password changes store bcrypt hashes");
+    }
+    const weakHelperPatientPassword = await request("POST", "/api/helper/add-patient", {
+      fname: "Fixture", lname: "Patient", gender: "Other", medical_history: "Fixture",
+      mobile_no: "5551234567", address: "123456", dob: "1990-01-01", password: "Weak123",
+    }, { headers: { Authorization: `Bearer ${helperSession}` } });
+    assert.equal(weakHelperPatientPassword.status, 400, "helper-created patient weak password is rejected");
+    const weakPatientCreatedPassword = await request("POST", "/api/patient/add-patients", {
+      password: "Weak123",
+    }, { headers: { Authorization: `Bearer ${patientSession}` } });
+    assert.equal(weakPatientCreatedPassword.status, 400, "patient-created family weak password is rejected");
     const pendingDoctor = await request("POST", "/api/doctor/login", {
       email: "pending-user@test.invalid", password: "ValidPass1!",
     });
@@ -260,6 +428,31 @@ test("login, recovery, existence checks, and registration responses do not discl
       assert.match(existing.body.message, /If the account is eligible/);
       assert.equal(existing.body.token, undefined, "recovery token is never returned publicly");
     }
+
+    const doctorMail = mails.find(message => message.channel === "sendgrid" && message.subject === "Virtual Sathi Login Password Reset");
+    const doctorToken = doctorMail?.text.match(/dresetpwd\/1\/([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/)?.[1];
+    assert.ok(doctorToken, "doctor reset token is sent only in the recovery email");
+    const beforeWeakResetRequests = database.calls.length;
+    const weakDoctorReset = await request("POST", "/api/doctor/forgetpwdresetpwd", {
+      doc_id: 1, token: doctorToken, password: "Weak123",
+    });
+    const weakPatientReset = await request("POST", "/api/patient/forgetpwdresetpwd", {
+      patient_id: 1, token: "malformed", password: "Weak123",
+    });
+    const weakHelperReset = await request("POST", "/api/patient/forgetpwdresetpwd", {
+      patient_id: 1, token: "malformed", password: "Weak123",
+    });
+    for (const result of [weakDoctorReset, weakPatientReset, weakHelperReset]) {
+      assert.equal(result.status, 400);
+      assert.match(result.body.message, /8-12 ASCII characters/);
+    }
+    assert.equal(database.calls.length, beforeWeakResetRequests, "weak reset passwords are rejected before account lookup");
+    const doctorReset = await request("POST", "/api/doctor/forgetpwdresetpwd", {
+      doc_id: 1, token: doctorToken, password: "Doctor1!",
+    });
+    assert.equal(doctorReset.status, 201);
+    assert.notEqual(users.doctor.hashed_pwd, "Doctor1!");
+    assert.equal(await bcrypt.compare("Doctor1!", users.doctor.hashed_pwd), true);
 
     // Exercise actual email-issued patient and helper links against the shared
     // reset endpoint, ensuring each updates only its own account table.
@@ -302,7 +495,7 @@ test("login, recovery, existence checks, and registration responses do not discl
     ];
     for (const failed of failedTokens) {
       const rejected = await request("POST", "/api/patient/forgetpwdresetpwd", {
-        ...failed, password: "ShouldNotApply1!",
+        ...failed, password: "NoApply1!",
       });
       assert.deepEqual(rejected, { status: 401, body: { message: "Invalid or expired reset link." } });
       assert.equal(rejected.body.token, undefined);
@@ -312,33 +505,33 @@ test("login, recovery, existence checks, and registration responses do not discl
     assert.equal(users.helper.hashed_pwd, initialHelperHash, "all invalid/cross-role tokens leave the helper unchanged");
 
     const patientReset = await request("POST", "/api/patient/forgetpwdresetpwd", {
-      patient_id: 1, token: patientToken, password: "PatientNewPass1!",
+      patient_id: 1, token: patientToken, password: "Patient1!",
     });
     assert.equal(patientReset.status, 201);
     assert.deepEqual(patientReset.body, { message: "Password updated successfully." });
     assert.notEqual(users.patient.hashed_pwd, "PatientNewPass1!", "patient password is stored as a hash");
-    assert.equal(await bcrypt.compare("PatientNewPass1!", users.patient.hashed_pwd), true);
+    assert.equal(await bcrypt.compare("Patient1!", users.patient.hashed_pwd), true);
     assert.equal(users.helper.hashed_pwd, initialHelperHash, "patient reset never updates helper credentials");
 
     const patientHashAfterReset = users.patient.hashed_pwd;
     const patientTokenReuse = await request("POST", "/api/patient/forgetpwdresetpwd", {
-      patient_id: 1, token: patientToken, password: "ReusedTokenPass1!",
+      patient_id: 1, token: patientToken, password: "Patient2!",
     });
     assert.deepEqual(patientTokenReuse, { status: 401, body: { message: "Invalid or expired reset link." } });
     assert.equal(users.patient.hashed_pwd, patientHashAfterReset, "patient reset tokens are single-use after the hash changes");
 
     const helperReset = await request("POST", "/api/patient/forgetpwdresetpwd", {
-      patient_id: 1, token: helperToken, password: "HelperNewPass1!",
+      patient_id: 1, token: helperToken, password: "Helper1!",
     });
     assert.equal(helperReset.status, 201, "shared UI and endpoint preserve helper reset compatibility");
     assert.deepEqual(helperReset.body, { message: "Password updated successfully." });
     assert.notEqual(users.helper.hashed_pwd, "HelperNewPass1!", "helper password is stored as a hash");
-    assert.equal(await bcrypt.compare("HelperNewPass1!", users.helper.hashed_pwd), true);
+    assert.equal(await bcrypt.compare("Helper1!", users.helper.hashed_pwd), true);
     assert.equal(users.patient.hashed_pwd, patientHashAfterReset, "helper reset never updates patient credentials");
 
     const helperHashAfterReset = users.helper.hashed_pwd;
     const helperTokenReuse = await request("POST", "/api/patient/forgetpwdresetpwd", {
-      patient_id: 1, token: helperToken, password: "ReusedTokenPass2!",
+      patient_id: 1, token: helperToken, password: "Helper2!",
     });
     assert.deepEqual(helperTokenReuse, { status: 401, body: { message: "Invalid or expired reset link." } });
     assert.equal(users.helper.hashed_pwd, helperHashAfterReset, "helper reset tokens are single-use after the hash changes");
@@ -371,6 +564,13 @@ test("login, recovery, existence checks, and registration responses do not discl
     assert.equal(duplicateDoctor.status, 401);
     assert.doesNotMatch(duplicateDoctor.body.message, /exist|registered|already/i);
 
+    const validDoctorSignup = await request("POST", "/api/doctor/signup", {
+      email: "new-doctor@test.invalid", password: "Doctor1!", mobile_no: "5557654329",
+    });
+    assert.equal(validDoctorSignup.status, 201);
+    assert.notEqual(users.doctor.createdHash, "Doctor1!");
+    assert.equal(await bcrypt.compare("Doctor1!", users.doctor.createdHash), true);
+
     const duplicatePatient = await request("POST", "/api/patient/signup", {
       fname: "Test", lname: "Patient", email: knownEmail, password: "ValidPass1!",
       mobile_no: knownPhone, mobile_secondary: "5551112222", gender: "other",
@@ -390,6 +590,8 @@ test("login, recovery, existence checks, and registration responses do not discl
     assert.equal(users.createdPatients.length, 1);
     assert.equal(users.createdPatients[0].helper_id, -1, "patient self-signup creates an unassigned patient record");
     assert.equal(users.createdPatients[0].email_id, "new-patient@test.invalid");
+    assert.notEqual(users.createdPatients[0].hashed_pwd, "ValidPass1!", "patient password is not stored in plaintext");
+    assert.equal(await bcrypt.compare("ValidPass1!", users.createdPatients[0].hashed_pwd), true);
     assert.equal(database.calls.some(call => call.sql.toLowerCase().startsWith("insert into helper_details")), false, "patient signup does not create a helper account");
 
     const patientOtpKnown = await request("POST", "/api/patient/send-otp-login", { email: knownEmail });
@@ -435,6 +637,20 @@ test("login, recovery, existence checks, and registration responses do not discl
       phone: "5557654321", countryCode: "1", otp: "0000", purpose: "helper-registration",
     });
     assert.deepEqual(phoneChallenge, noPhoneChallenge);
+
+    database.setLoginLockoutFailure(true);
+    for (const [route, body] of [
+      ["/api/patient/login", { email: knownEmail, password: "ValidPass1!" }],
+      ["/api/helper/login", { email_id: knownEmail, password: "ValidPass1!" }],
+      ["/api/doctor/login", { email: knownEmail, password: "ValidPass1!" }],
+      ["/api/admin/login", { email: knownEmail, password: "ValidPass1!" }],
+    ]) {
+      const failedClosed = await request("POST", route, body, { includeHeaders: true });
+      assert.equal(failedClosed.status, 503, `${route} fails closed when lockout storage is unavailable`);
+      assert.deepEqual(failedClosed.body, { message: "Unable to authenticate right now." });
+      assert.doesNotMatch(failedClosed.headers.get("set-cookie") || "", /auth_token=/i, `${route} issues no session`);
+    }
+    database.setLoginLockoutFailure(false);
   });
 });
 

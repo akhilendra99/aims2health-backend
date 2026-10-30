@@ -1,4 +1,4 @@
-const test = require('node:test');
+﻿const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -6,12 +6,13 @@ const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 const root = path.resolve(__dirname, '..');
 
 function loadPatientRouter({ failUpdate = false, failSecondPatientLookup = false } = {}) {
   const filename = path.join(root, 'routes/patients.js');
   const localRequire = createRequire(filename);
-  const sent = { loginOtp: null, phoneOtp: null, emailOtp: null };
+  const sent = { loginOtp: null, phoneOtp: null, emailOtp: null, emailText: null };
   const patient = { patient_id: 41, email_id: 'patient-otp@test.invalid', mobile_no: '5554443322', countryCode: '1', fname: 'OTP', lname: 'Fixture' };
   let patientLookupCount = 0;
   let clock = Date.now();
@@ -61,6 +62,7 @@ function loadPatientRouter({ failUpdate = false, failSecondPatientLookup = false
     return { data: { status: 'Accepted' }, status: 200, headers: {} };
   } };
   const zeptomail = { sendMail: async message => {
+    sent.emailText = message.text;
     const match = String(message.text).match(/OTP for secure login is (\d{4})/);
     sent.emailOtp = match?.[1];
   } };
@@ -88,16 +90,21 @@ function loadPatientRouter({ failUpdate = false, failSecondPatientLookup = false
 async function withServer(router, run) {
   const app = express();
   app.use(express.json());
+  app.use(cookieParser());
+  app.use(require('../middleware/csrf-protection').requireCsrfToken);
   app.use('/api/patient', router);
   app.get('/protected', require('../middleware/authenticate')(['patient']), (_req, res) => res.status(200).json({ ok: true }));
   const server = await new Promise(resolve => {
     const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
   });
   try {
-    const request = async (method, route, body, token) => {
+    const request = async (method, route, body, credential) => {
+      const credentials = typeof credential === 'string'
+        ? { Authorization: `Bearer ${credential}` }
+        : credential || {};
       const response = await fetch(`http://127.0.0.1:${server.address().port}${route}`, {
         method,
-        headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...credentials },
         body: body ? JSON.stringify(body) : undefined,
         signal: AbortSignal.timeout(10000),
       });
@@ -110,7 +117,7 @@ async function withServer(router, run) {
   }
 }
 
-test('patient OTP login issues JWT only after a current correct OTP; failed or replayed codes do not', async t => {
+test('patient OTP login issues HttpOnly cookie only after current correct OTP; failed or replayed codes do not', async t => {
   const keys = ['JWT_SECRET_PATIENT', 'JWT_SECRET_DOC', 'JWT_SECRET_ADMIN'];
   const previous = keys.map(key => process.env[key]);
   const previousEhrConnect = process.env.EHR_CONNECT;
@@ -131,26 +138,48 @@ test('patient OTP login issues JWT only after a current correct OTP; failed or r
     const bad = await request('POST', '/api/patient/verify-otp-login', { email: 'patient-otp@test.invalid', otp: '000000' });
     assert.equal(bad.status, 401);
     assert.equal(bad.body.token, undefined);
+    assert.equal(bad.headers.get('set-cookie'), null, 'invalid OTP does not set auth cookies');
     assert.equal((await request('GET', '/protected', undefined, bad.body.token)).status, 401);
 
     const success = await request('POST', '/api/patient/verify-otp-login', { email: 'patient-otp@test.invalid', otp: fixture.sent.loginOtp });
     assert.equal(success.status, 200);
-    assert.equal(jwt.verify(success.body.token, process.env.JWT_SECRET_PATIENT).role, 'patient');
-    assert.equal((await request('GET', '/protected', undefined, success.body.token)).status, 200);
+    assert.equal(success.body.token, undefined, 'patient JWT is absent from readable response JSON');
+    assert.equal(success.body.expiresIn, 3600);
+    assert.equal(success.body.userId, 41);
+    assert.equal(success.body.userEmail, 'patient-otp@test.invalid');
+    assert.equal(success.body.userName, 'OTP Fixture');
+    const successCookies = success.headers.getSetCookie();
+    const authCookie = successCookies.find(value => value.startsWith('auth_token='));
+    const csrfCookie = successCookies.find(value => value.startsWith('csrf_token='));
+    assert.ok(authCookie, 'success sets the HttpOnly auth cookie');
+    assert.ok(csrfCookie, 'success sets the CSRF cookie');
+    assert.match(authCookie, /; HttpOnly/i);
+    assert.match(authCookie, /; Secure/i);
+    assert.match(authCookie, /; SameSite=Lax/i);
+    assert.doesNotMatch(csrfCookie, /; HttpOnly/i);
+    const cookieHeader = `${authCookie.split(';', 1)[0]}; ${csrfCookie.split(';', 1)[0]}`;
+    const csrfHeader = decodeURIComponent(csrfCookie.match(/^csrf_token=([^;]+)/)[1]);
+    const cookieCredential = { Cookie: cookieHeader };
+    assert.equal((await request('GET', '/protected', undefined, cookieCredential)).status, 200, 'protected API accepts the server-issued cookie');
 
     const replay = await request('POST', '/api/patient/verify-otp-login', { email: 'patient-otp@test.invalid', otp: fixture.sent.loginOtp });
     assert.equal(replay.status, 401);
     assert.equal(replay.body.token, undefined);
-    // A saved success response includes a real JWT. Replaying that bearer
-    // credential remains a session-management concern, not an OTP bypass.
-    assert.equal((await request('GET', '/protected', undefined, success.body.token)).status, 200);
+    assert.equal(replay.headers.get('set-cookie'), null, 'replayed OTP does not set auth cookies');
     assert.equal((await request('GET', '/protected', undefined, 'response-replacement')).status, 401);
+
+    const logout = await request('POST', '/api/patient/logout', {}, { ...cookieCredential, 'x-csrf-token': csrfHeader });
+    assert.equal(logout.status, 200);
+    assert.match(logout.headers.get('set-cookie') || '', /auth_token=;/);
+    assert.match(logout.headers.get('set-cookie') || '', /csrf_token=;/);
+    assert.equal((await request('GET', '/protected', undefined, cookieCredential)).status, 401, 'logout revokes the OTP-issued cookie token');
 
     assert.equal((await request('POST', '/api/patient/send-otp-login', { email: 'patient-otp@test.invalid' })).status, 200);
     fixture.advance(5 * 60 * 1000 + 1);
     const expired = await request('POST', '/api/patient/verify-otp-login', { email: 'patient-otp@test.invalid', otp: fixture.sent.loginOtp });
     assert.equal(expired.status, 401);
     assert.equal(expired.body.token, undefined);
+    assert.equal(expired.headers.get('set-cookie'), null, 'expired OTP does not set auth cookies');
   });
 });
 
@@ -180,6 +209,7 @@ test('patient phone/email verification is bound to the signed-in account and con
     assert.equal((await request('POST', '/api/patient/sendEmailVerifyOTP', { email: 'other@test.invalid' }, patientToken)).status, 400);
     assert.equal((await request('POST', '/api/patient/sendEmailVerifyOTP', { email: 'PATIENT-OTP@test.invalid' }, patientToken)).status, 201);
     assert.match(fixture.sent.emailOtp, /^\d{4}$/);
+    assert.match(fixture.sent.emailText, /valid for 8 minutes/i);
     assert.equal((await request('POST', '/api/patient/verifyEmail', { email: 'patient-otp@test.invalid', otp: fixture.sent.emailOtp }, patientToken)).status, 201);
     assert.equal((await request('POST', '/api/patient/verifyEmail', { email: 'patient-otp@test.invalid', otp: fixture.sent.emailOtp }, patientToken)).status, 400, 'email OTP is single use');
   });
@@ -215,5 +245,9 @@ test('patient OTP database failures do not report successful verification or iss
     assert.equal(failedLogin.status, 401);
     assert.equal(failedLogin.body.message, 'Invalid or expired OTP');
     assert.equal(failedLogin.body.token, undefined);
+    assert.equal(failedLogin.headers.get('set-cookie'), null);
   });
 });
+
+
+
